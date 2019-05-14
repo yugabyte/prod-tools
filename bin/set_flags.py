@@ -33,7 +33,6 @@ IP_RE = re.compile(r' [a-z]+@(\d+([.]\d+){3}) ')
 YUGABYTE_HOME = '/home/yugabyte'
 TS_CLI_PATH = YUGABYTE_HOME + '/tserver/bin/yb-ts-cli'
 SERVER_CONF_PATH_TEMPLATE = YUGABYTE_HOME + '/{server_type}/conf/server.conf'
-DEFAULT_CONNECT_CMDS_PATH = os.path.expanduser('~/yb_ssh_cmds.txt')
 HOW_TO_CREATE_CONNECT_FILE = (
     'To create this file, go to YugaWare, click on a '
     "universe's Nodes tab, then click Connect, and copy-and-paste the list of SSH "
@@ -71,10 +70,19 @@ def read_ssh_cmds(file_path):
     with open(file_path) as connect_file:
         for line in connect_file:
             line = line.strip()
-            if line:
-                # Ensure that every line contains a valid IP address.
-                get_ip_from_ssh_cmd(line)
-                connect_cmds.append(line)
+            if not line:
+                continue
+            # Ensure that every line contains a valid IP address.
+            get_ip_from_ssh_cmd(line)
+
+            # Ensure the line starts as expected.
+            if not line.startswith('sudo ssh -i '):
+                raise ValueError(
+                    "Unexpected SSH command pasted from YugaWare's Connect window: %s. "
+                    "Should start with 'sudo ssh -i'." % line)
+
+            connect_cmds.append(line)
+
     return connect_cmds
 
 
@@ -94,10 +102,10 @@ def parse_args(arg_list):
     parser = argparse.ArgumentParser(
         description='Set flags of masters and tablet servers at run time')
     parser.add_argument(
-        '--connect_cmds_file', 
-        help='File with SSH connection commands (from command line). Default: ' +
-             DEFAULT_CONNECT_CMDS_PATH + '. ' + HOW_TO_CREATE_CONNECT_FILE,
-        default=DEFAULT_CONNECT_CMDS_PATH)
+        '--connect_cmds_file',
+        help='File with SSH connection commands (from command line). ' +
+             HOW_TO_CREATE_CONNECT_FILE,
+        required=True)
     parser.add_argument('--flag_name', required=True)
     parser.add_argument('--flag_value', required=True)
     parser.add_argument(
@@ -133,17 +141,14 @@ def gzip_and_base64_encode(value):
     return base64.b64encode(gzipped_value)
 
 
-class ScriptInstaller:
+def get_remote_script_cmd():
     """
-    Allows installing this script on remote nodes so we can e.g. modify configuration files.
+    Returns the command that will have the effect of running this script on a remote node, without
+    actually copying any files.
     """
-
-    def __init__(self):
-        with open(__file__) as this_script_file:
-            self.base64_gzipped_script = gzip_and_base64_encode(this_script_file.read())
-
-    def get_script_cmd(self):
-        return 'python -c "$( echo %s | base64 -d | gzip -d )"' % self.base64_gzipped_script
+    with open(__file__) as this_script_file:
+        base64_gzipped_script = gzip_and_base64_encode(this_script_file.read())
+    return 'python -c "$( echo %s | base64 -d | gzip -d )"' % base64_gzipped_script
 
 
 def get_valid_flag_types_for_binary(server_binary):
@@ -244,7 +249,7 @@ class LocalFlagUpdater:
         flag_type = flag_types[self.args.flag_name]
 
         if flag_type == 'string':
-            logging.info("Not attempting to set a flag of type %s in memory" % flag_type)
+            logging.info("Not attempting to set a flag of type %s via an RPC call" % flag_type)
         else:
             ts_cli_cmd = [
                 TS_CLI_PATH,
@@ -259,7 +264,7 @@ class LocalFlagUpdater:
 
             try:
                 subprocess.check_call(ts_cli_cmd)
-                logging.info("Successfully %s in memory\n" % msg_common)
+                logging.info("Successfully %s via an RPC call\n" % msg_common)
             except subprocess.CalledProcessError as ex:
                 raise AppError(str(ex))
 
@@ -280,27 +285,9 @@ class LocalFlagUpdater:
                     self.common_msg_part, server_type_info['server_type'], str(ex)))
                 self.success = False
 
-def main():
-    arg_list = sys.argv[1:]
-    if len(sys.argv) == 2:
-        # A mechanism allowing to bypass Bash escaping and run the script over SSH.
-        try:
-            arg_list = json.loads(base64.b64decode(sys.argv[1]))
-        except TypeError as ex:
-            # Intentional -- we'll parse the arguments in the usual way.
-            pass
-        except ValueError as ex:
-            # Ditto.
-            pass
 
-    args = parse_args(arg_list)
-
-    if args.local:
-        updater = LocalFlagUpdater(args)
-        updater.update()
-        sys.exit(0 if updater.success else 1)
-
-    installer = ScriptInstaller()
+def set_flag_on_all_nodes(arg_list, args):
+    remote_script_cmd = get_remote_script_cmd()
     connect_cmds = validate_and_read_ssh_cmds(args.connect_cmds_file)
 
     num_successes = 0
@@ -315,7 +302,7 @@ def main():
 
         logging.info('Processing node %s', ip)
         full_cmd = ssh_cmd + " '%s' %s" % (
-            installer.get_script_cmd(),
+            remote_script_cmd,
             base64.b64encode(json.dumps(remote_args + ['--ip', ip])))
 
         if args.verbose:
@@ -334,13 +321,38 @@ def main():
             num_failures += 1
 
     sys.stderr.write(
-        "Finished connecting to %d nodes (from %d commands)\n"
+        "Finished making flag changes on %d nodes\n"
         "Total successes: %d\n"
         "Total failures: %d\n" % (
             len(ips),
-            len(connect_cmds),
             num_successes,
             num_failures))
+    return num_failures == 0
+
+
+def main():
+    arg_list = sys.argv[1:]
+    if len(sys.argv) == 2:
+        # A mechanism allowing to bypass Bash escaping and run the script over SSH.
+        try:
+            arg_list = json.loads(base64.b64decode(sys.argv[1]))
+        except TypeError as ex:
+            # Intentional -- we'll parse the arguments in the usual way.
+            pass
+        except ValueError as ex:
+            # Ditto.
+            pass
+
+    args = parse_args(arg_list)
+
+    if args.local:
+        updater = LocalFlagUpdater(args)
+        updater.update()
+        success = updater.success
+    else:
+        success = set_flag_on_all_nodes(arg_list, args)
+
+    sys.exit(0 if success else 1)
 
 
 if __name__ == '__main__':
